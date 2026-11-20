@@ -10,6 +10,10 @@
  *    each knob's word moves a quarter of the way to its value every 384
  *    frames, and modulation is added on top, unsmoothed, every 48 frames (as
  *    the Monomachine's LFOs are);
+ *  - the pitch words: Pitch Mod is block word 30 (where the LFOs aimed at
+ *    PTCH land), MIDI pitch bend is added to it as KIT ASSIGN JOY R/L would
+ *    add it (MIRR on, PAGE PTCH, DEST Bend Range, ADD +63), and Master Tune
+ *    is word 38 from the main OS's table;
  *  - the track filter, which sits between the machine and the AMP section on
  *    the unit: left out (Mono Filter Distortion is that filter), and stood in
  *    for by its plain level at its defaults, 0.4455;
@@ -27,7 +31,8 @@
 #include "mono_swave.h"
 
 /* The machine's eight knobs, then the AMP page's. */
-enum { SYN, TUNE = SYN + 7, ATK = 8, HOLD, DEC, REL, VOL, PAN, PORT, NPARAM };
+enum { SYN, TUNE = SYN + 7, ATK = 8, HOLD, DEC, REL, VOL, PAN, PORT, PMOD, BEND, MTUNE, NPARAM };
+#define KNOBS BEND      /* the parameters that are knobs: slewed, modulatable, 0..127 */
 static const int amp_word[7] = {MS_ATK, MS_HOLD, MS_DEC, MS_REL, MS_VOL, MS_PAN, MS_PORT};
 #define FILTER_LEVEL 0x3905a5   /* 0.4455: the track filter's level at its defaults, without its inversion */
 
@@ -50,12 +55,15 @@ static const Machine machines[MS_MACHINES] = {
 };
 static const char *const amp_label[7] = {"Attack", "Hold", "Decay", "Release", "Volume", "Pan", "Portamento"};
 static const double amp_def[7] = {0, 0, 64, 64, 64, 64, 0};
+static const char *const pitch_label[3] = {"Pitch Mod", "Bend Range", "Master Tune"};
+static const double pitch_def[3] = {64, 1, 440}, pitch_lo[3] = {0, 0, 400}, pitch_hi[3] = {127, 7, 499.9};
+static const char *const bend_name[8] = {"1/12", "2/12", "7/12", "1OCT", "2OCT", "4OCT", "8OCT", "16OC"};
 
 static const char *const features[] = {
    CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SYNTHESIZER, CLAP_PLUGIN_FEATURE_STEREO, NULL
 };
 #define DESCRIPTOR(m, text) { .clap_version = CLAP_VERSION_INIT, .id = machines[m].id, .name = machines[m].name, \
-   .vendor = "Independent DSP", .url = "", .manual_url = "", .support_url = "", .version = "0.1.0", \
+   .vendor = "Independent DSP", .url = "", .manual_url = "", .support_url = "", .version = "0.2.0", \
    .description = text, .features = features }
 static const clap_plugin_descriptor_t descriptors[MS_MACHINES] = {
    DESCRIPTOR(MS_SAW, "The Monomachine SWAVE SAW machine and AMP envelope, ported from its DSP code"),
@@ -69,7 +77,9 @@ static const clap_plugin_descriptor_t descriptors[MS_MACHINES] = {
 #define ENS_START 64   /* blocks of ENS's start, its chorus muted */
 
 static double clamp(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
-static double def_of(int m, int id) { return id < 8 ? machines[m].def[id] : amp_def[id - 8]; }
+static double def_of(int m, int id) { return id < 8 ? machines[m].def[id] : id < PMOD ? amp_def[id - 8] : pitch_def[id - PMOD]; }
+static double lo_of(int id) { return id < PMOD ? 0 : pitch_lo[id - PMOD]; }
+static double hi_of(int id) { return id < PMOD ? 127 : pitch_hi[id - PMOD]; }
 
 /* ---- sample-rate conversion (windowed sinc, as in Mono Delay) -------------- */
 
@@ -136,7 +146,8 @@ typedef struct {
    bool active, direct, settled;
    uint32_t latency, blocks;
    int pos;
-   int32_t knob[NPARAM], syn[8], amp[8], pitch_word, tick;
+   int32_t knob[KNOBS], syn[8], amp[8], pitch_word, tick, pmod, mtune;
+   int bend;                          /* the pitch bend's top 8 bits, 128 at the centre */
    int trig_word;                     /* block word 40 for the next block */
    double tempo;
    /* notes: the keys held, in the order pressed; the note sounding; the frame's news (1 on, 2 off) */
@@ -159,13 +170,15 @@ static int32_t tick_of(double bpm) { return (int32_t)clamp(lround(24.0 * bpm), 7
 /* Start of a control frame (three blocks): the words the main CPU sends. */
 static void control_frame(Plugin *s) {
    const uint32_t frame = s->blocks / 3;
-   for (int p = 0; p < NPARAM; ++p) {
+   for (int p = 0; p < KNOBS; ++p) {
       const int32_t target = (int32_t)lrint(clamp(value(s, p), 0, 127) * 65536.0);
       if (!s->settled) s->knob[p] = target;
       else if ((frame & 7) == 1) s->knob[p] = (3 * s->knob[p] + target) >> 2;
       const int32_t word = s->mod[p] == 0 ? s->knob[p] : (int32_t)lrint(clamp(s->knob[p] + s->mod[p] * 65536.0, 0, 0x7effff));
-      if (p < 8) s->syn[p] = word; else s->amp[amp_word[p - 8]] = word;
+      if (p < 8) s->syn[p] = word; else if (p < PMOD) s->amp[amp_word[p - 8]] = word; else s->pmod = word;
    }
+   s->pmod = ms_add_mod(s->pmod, ms_bend(s->bend, (int)lrint(value(s, BEND))));
+   s->mtune = ms_master_tune((int)lrint(clamp(value(s, MTUNE) * 10, 4000, 4999)));
    s->pitch_word = (s->note << 11) / 12;   /* the note word */
    s->tick = tick_of(s->tempo);
    s->trig_word = s->pending == 1 ? 0x81 : s->pending == 2 ? 0x02 : 0;
@@ -186,7 +199,7 @@ static void native_frame(Plugin *s, double out[2]) {
       if (s->blocks % 3 == 0) control_frame(s);
       s->blocks++;
       int32_t m[MS_FRAMES], g[2][MS_FRAMES], y[2][MS_FRAMES];
-      ms_block(&s->core, s->syn, ms_pitch(&s->glide, s->pitch_word, s->syn[7], s->amp[MS_PORT], s->tick), s->trig_word & 0x80, m);
+      ms_block(&s->core, s->syn, ms_pitch(&s->glide, s->pitch_word, s->syn[7], s->amp[MS_PORT], s->tick, s->pmod, s->mtune), s->trig_word & 0x80, m);
       ms_amp(&s->env, s->trig_word & 0x7f, s->amp, 0x800000 / s->tick, g);
       s->trig_word = 0;
       for (int c = 0; c < 2; ++c)
@@ -219,6 +232,7 @@ static void reset(Plugin *s) {
    s->nheld = 0;
    s->note = 60;
    s->pending = 0;
+   s->bend = 128;
    rs_reset(&s->down);
    if (s->machine == MS_ENS) {   /* the machine's start, no note playing */
       double ignored[2];
@@ -285,10 +299,10 @@ static void event(Plugin *s, const clap_event_header_t *h) {
    if (h->type == CLAP_EVENT_PARAM_VALUE && h->size >= sizeof(clap_event_param_value_t)) {
       const clap_event_param_value_t *e = (const void *)h;
       if (e->param_id < NPARAM && e->note_id == -1 && e->port_index == -1 && e->channel == -1 && e->key == -1 && isfinite(e->value))
-         set_value(s, (int)e->param_id, clamp(e->value, 0, 127));
+         set_value(s, (int)e->param_id, clamp(e->value, lo_of((int)e->param_id), hi_of((int)e->param_id)));
    } else if (h->type == CLAP_EVENT_PARAM_MOD && h->size >= sizeof(clap_event_param_mod_t)) {
       const clap_event_param_mod_t *e = (const void *)h;
-      if (e->param_id < NPARAM && e->note_id == -1 && e->port_index == -1 && e->channel == -1 && e->key == -1 && isfinite(e->amount))
+      if (e->param_id < KNOBS && e->note_id == -1 && e->port_index == -1 && e->channel == -1 && e->key == -1 && isfinite(e->amount))
          s->mod[e->param_id] = clamp(e->amount, -127, 127);
    } else if ((h->type == CLAP_EVENT_NOTE_ON || h->type == CLAP_EVENT_NOTE_OFF) && h->size >= sizeof(clap_event_note_t)) {
       const clap_event_note_t *e = (const void *)h;
@@ -298,6 +312,7 @@ static void event(Plugin *s, const clap_event_header_t *h) {
       const int status = e->data[0] & 0xf0, key = e->data[1] & 0x7f;
       if (status == 0x90 && e->data[2] > 0) note_on(s, key);
       else if (status == 0x80 || status == 0x90) note_off(s, key);
+      else if (status == 0xe0) s->bend = (e->data[2] & 0x7f) * 2 + ((e->data[1] & 0x7f) >> 6);
    }
 }
 
@@ -348,11 +363,12 @@ static bool params_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *p
    memset(pi, 0, sizeof *pi);
    pi->id = i;
    pi->flags = i < 8 && (machines[s->machine].unused >> i & 1) ? CLAP_PARAM_IS_HIDDEN
-             : CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE | CLAP_PARAM_REQUIRES_PROCESS;
-   snprintf(pi->name, sizeof pi->name, "%s", i < 8 ? machines[s->machine].label[i] : amp_label[i - 8]);
-   snprintf(pi->module, sizeof pi->module, "%s", i < 8 ? "Machine" : "Amp");
-   pi->min_value = 0;
-   pi->max_value = 127;
+             : CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_REQUIRES_PROCESS | (i < KNOBS ? CLAP_PARAM_IS_MODULATABLE : 0)
+               | (i == BEND ? CLAP_PARAM_IS_STEPPED : 0);
+   snprintf(pi->name, sizeof pi->name, "%s", i < 8 ? machines[s->machine].label[i] : i < PMOD ? amp_label[i - 8] : pitch_label[i - PMOD]);
+   snprintf(pi->module, sizeof pi->module, "%s", i < 8 ? "Machine" : i < PMOD ? "Amp" : "Pitch");
+   pi->min_value = lo_of((int)i);
+   pi->max_value = hi_of((int)i);
    pi->default_value = def_of(s->machine, (int)i);
    return true;
 }
@@ -367,7 +383,13 @@ static bool params_to_text(const clap_plugin_t *p, clap_id id, double v, char *o
    if (id >= NPARAM || !out || !cap || !isfinite(v)) return false;
    const int32_t w = (int32_t)lrint(clamp(v, 0, 127) * 65536.0);
    const int m = s->machine;
-   if (id == TUNE) snprintf(out, cap, "%.1f (%+.0f cents)", v, (ms_mpy(0x2ab, w) / 16777216.0 - 341.5) * 1200 / 2048);
+   if (id == PMOD) snprintf(out, cap, "%.1f (%+.2f st)", v, (ms_mpy(0xb000, w) / 16777216.0 - 0x5800) * 12 / 2048);
+   else if (id == BEND) {
+      const int r = (int)lrint(clamp(v, 0, 7));
+      snprintf(out, cap, "%s (+-%.2f st)", bend_name[r], ms_bend(255, r) * (0xb000 * 2 / 16777216.0) * 12 / 2048);
+   }
+   else if (id == MTUNE) snprintf(out, cap, "%.1f Hz", lrint(clamp(v, 400, 499.9) * 10) / 10.0);
+   else if (id == TUNE) snprintf(out, cap, "%.1f (%+.0f cents)", v, (ms_mpy(0x2ab, w) / 16777216.0 - 341.5) * 1200 / 2048);
    else if (id == PAN) snprintf(out, cap, "%.1f (%+.0f)", v, floor(v) - 64);
    else if ((m == MS_SAW || m == MS_PULS) && id == 1) {   /* the outer pair's periods x (1 +- d); SAW's inner pair has half */
       const double d = m == MS_SAW ? (int)lrint(fmin(v, 127.5)) / 4096.0 : w / 8388608.0 / 64;
@@ -387,10 +409,13 @@ static bool params_to_text(const clap_plugin_t *p, clap_id id, double v, char *o
 static bool params_from_text(const clap_plugin_t *p, clap_id id, const char *text, double *v) {
    (void)p;
    if (id >= NPARAM || !text || !v) return false;
+   if (id == BEND)
+      for (int r = 0; r < 8; ++r)
+         if (!strncmp(text, bend_name[r], strlen(bend_name[r]))) { *v = r; return true; }
    char *end = NULL;
    const double x = strtod(text, &end);
    if (end == text || !isfinite(x)) return false;
-   *v = clamp(x, 0, 127);
+   *v = clamp(x, lo_of((int)id), hi_of((int)id));
    return true;
 }
 static void params_flush(const clap_plugin_t *p, const clap_input_events_t *in, const clap_output_events_t *out) {
@@ -407,7 +432,7 @@ static bool state_save(const clap_plugin_t *p, const clap_ostream_t *st) {
    const Plugin *s = p->plugin_data;
    uint8_t buf[8 + 8 * NPARAM] = {0};
    memcpy(buf, machines[s->machine].magic, 4);
-   buf[7] = 1;
+   buf[7] = 2;
    for (int i = 0; i < NPARAM; ++i)
       for (int b = 0; b < 8; ++b) buf[8 + 8 * i + b] = (uint8_t)(to_bits(value(s, i)) >> (8 * b));
    for (uint64_t done = 0; done < sizeof buf;) {
@@ -420,18 +445,23 @@ static bool state_save(const clap_plugin_t *p, const clap_ostream_t *st) {
 static bool state_load(const clap_plugin_t *p, const clap_istream_t *st) {
    Plugin *s = p->plugin_data;
    uint8_t buf[8 + 8 * NPARAM];
-   for (uint64_t done = 0; done < sizeof buf;) {
-      const int64_t n = st && st->read ? st->read(st, buf + done, sizeof buf - done) : -1;
+   uint64_t size = 8;
+   for (uint64_t done = 0; done < size;) {
+      const int64_t n = st && st->read ? st->read(st, buf + done, size - done) : -1;
       if (n <= 0) return false;
       done += (uint64_t)n;
+      if (done == 8 && size == 8) {   /* the header: version 1 had no pitch parameters */
+         if (memcmp(buf, machines[s->machine].magic, 4) || buf[4] || buf[5] || buf[6] || buf[7] < 1 || buf[7] > 2) return false;
+         size = 8 + 8 * (uint64_t)(buf[7] == 1 ? PMOD : NPARAM);
+      }
    }
-   if (memcmp(buf, machines[s->machine].magic, 4) || buf[4] || buf[5] || buf[6] || buf[7] != 1) return false;
    double v[NPARAM];
-   for (int i = 0; i < NPARAM; ++i) {
+   for (int i = PMOD; i < NPARAM; ++i) v[i] = def_of(s->machine, i);
+   for (int i = 0; i < (int)(size - 8) / 8; ++i) {
       uint64_t u = 0;
       for (int b = 0; b < 8; ++b) u |= (uint64_t)buf[8 + 8 * i + b] << (8 * b);
       v[i] = bits_to(u);
-      if (!isfinite(v[i]) || v[i] < 0 || v[i] > 127) return false;
+      if (!isfinite(v[i]) || v[i] < lo_of(i) || v[i] > hi_of(i)) return false;
    }
    for (int i = 0; i < NPARAM; ++i) set_value(s, i, v[i]);
    const clap_host_params_t *hp = s->host->get_extension ? s->host->get_extension(s->host, CLAP_EXT_PARAMS) : NULL;

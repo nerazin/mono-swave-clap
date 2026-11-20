@@ -3,15 +3,19 @@
  *  - the bundle offers the three machines, each with its knobs and the AMP page
  *  - at 44.1 kHz each plug-in's output is the core's, exactly, for notes
  *    taken on the 48-frame control grid (ENS after its 64-block start)
- *  - SAW as a single saw sounds a note at the core's frequency (A4 0.04
- *    cents under 440 Hz) at 44.1 and 48 kHz, and TUNE at 127 raises it by
+ *  - SAW as a single saw sounds a note at the core's frequency (A4 0.55
+ *    cents over 440 Hz) at 44.1 and 48 kHz, and TUNE at 127 raises it by
  *    197 cents
  *  - releasing the last note fades out; releasing the newest of two held
  *    notes returns to the other
+ *  - the pitch words: MIDI pitch bend at its ends moves SAW by the Bend
+ *    Range's +-201 cents (2/12), Pitch Mod 65 by +206 cents, Master Tune
+ *    415.3 Hz by the main OS's word, all exactly the core's frequency
  *  - ENS's chorus changes the sound, and its width separates left and right
  *  - a note's onset comes no earlier than the reported latency, and at most
  *    one control frame and one block after it, at 22.05 to 96 kHz
- *  - state round trip, rejected bad states, parameter text, the hidden knob */
+ *  - state round trip, a version 1 state (no pitch parameters), rejected bad
+ *    states, parameter text, the hidden knob */
 #include <clap/clap.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -21,8 +25,11 @@
 
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); puts(""); exit(1); } } while (0)
 #define N (192 * 512)   /* whole process calls */
-#define NP 15
+#define NP 18
 #define PORT 14
+#define PMOD 15
+#define BEND 16
+#define MTUNE 17
 #define MAXEV 16
 
 typedef union { clap_event_header_t h; clap_event_param_value_t v; clap_event_note_t n; clap_event_midi_t m; } Event;
@@ -53,7 +60,7 @@ static const clap_plugin_t *make(int m, const double v[NP], double rate) {
    CHECK(p->activate(p, rate, 1, 512) && p->start_processing(p), "activate");
    return p;
 }
-/* Notes: frame, on (1) or off (0), key; sorted by frame. */
+/* Notes: frame, on (1) or off (0), key; sorted by frame. on 2 is a MIDI pitch bend to key (0..16383). */
 typedef struct { int at, on, key; } Note;
 static void run(const clap_plugin_t *p, const Note *notes, int count, double out[2][N]) {
    Events ev = {{NULL, ev_size, ev_get}, {{{0}}}, 0};
@@ -62,8 +69,12 @@ static void run(const clap_plugin_t *p, const Note *notes, int count, double out
    for (uint32_t at = 0; at < N; at += 512) {
       ev.n = 0;
       for (; next < count && notes[next].at < (int)at + 512; ++next)
-         ev.v[ev.n++].n = (clap_event_note_t){{sizeof ev.v[0].n, (uint32_t)(notes[next].at - (int)at), CLAP_CORE_EVENT_SPACE_ID,
-            (uint16_t)(notes[next].on ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF), 0}, -1, 0, 0, (int16_t)notes[next].key, 1.0};
+         if (notes[next].on == 2)
+            ev.v[ev.n++].m = (clap_event_midi_t){{sizeof ev.v[0].m, (uint32_t)(notes[next].at - (int)at), CLAP_CORE_EVENT_SPACE_ID,
+               CLAP_EVENT_MIDI, 0}, 0, {0xe0, (uint8_t)(notes[next].key & 0x7f), (uint8_t)(notes[next].key >> 7)}};
+         else
+            ev.v[ev.n++].n = (clap_event_note_t){{sizeof ev.v[0].n, (uint32_t)(notes[next].at - (int)at), CLAP_CORE_EVENT_SPACE_ID,
+               (uint16_t)(notes[next].on ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF), 0}, -1, 0, 0, (int16_t)notes[next].key, 1.0};
       double *o[2] = {out[0] + at, out[1] + at};
       clap_audio_buffer_t ao = {NULL, o, 2, 0, 0};
       clap_process_t pr = {0};
@@ -83,13 +94,15 @@ static double frequency(double out[2][N], int from, int to, double rate) {
       if (out[0][n - 1] < top / 2 && out[0][n] >= top / 2) { if (first < 0) first = n; last = n; ++count; }
    return count > 1 ? (count - 1) * rate / (last - first) : 0;
 }
-/* SAW's main saw for a settled note at TUNE 64: one edge a period, 2^24 a sample. */
-static double note_hz(int note) {
+/* SAW's main saw for a settled note at TUNE 64: one edge a period, 2^24 a sample; with pitch modulation
+ * word pmod and master tune word mtune. */
+static double note_hz_at(int note, int32_t pmod, int32_t mtune) {
    MsPitch g;
    ms_pitch_reset(&g, (note << 11) / 12);
-   const int32_t p = ms_pitch(&g, (note << 11) / 12, 64 << 16, 0, 2880);
+   const int32_t p = ms_pitch(&g, (note << 11) / 12, 64 << 16, 0, 2880, pmod, mtune);
    return 44100 / ((double)ms_mpy(0x17a6, ms_sat(ms_w(ms_exp[0x7ff - (p & 0x7ff)]) >> (p >> 11))) / 16777216.0);
 }
+static double note_hz(int note) { return note_hz_at(note, 64 << 16, 0); }
 static double peak(double out[2][N], int c, int from, int to) {
    double x = 0;
    for (int n = from; n < to; ++n) x = fmax(x, fabs(out[c][n]));
@@ -115,7 +128,7 @@ int main(int argc, char **argv) {
    CHECK(factory && factory->get_plugin_count(factory) == 3, "three plug-ins");
    for (uint32_t m = 0; m < 3; ++m) CHECK(!strcmp(factory->get_plugin_descriptor(factory, m)->id, ids[m]), "descriptor %u", m);
    ms_tables();
-   const double defaults[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
+   const double defaults[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
 
    /* exact against the core at 44.1 kHz: notes on and off at and between control frames, without and with
     * portamento, the machines' knobs away from their defaults */
@@ -128,12 +141,14 @@ int main(int argc, char **argv) {
       memcpy(v, defaults, sizeof v);
       memcpy(v, knobs[m], sizeof knobs[m]);
       if (t >= 3) v[PORT] = 50;   /* about 170 blocks at 120 BPM */
+      if (t == 3) { v[PMOD] = 70.25; v[MTUNE] = 432.1; }
       const clap_plugin_t *p = make(m, v, 44100);
       CHECK(latency_of(p) == 0, "latency at 44.1 kHz");
       const clap_plugin_params_t *params = p->get_extension(p, CLAP_EXT_PARAMS);
       CHECK(params->count(p) == NP, "parameter count");
       int32_t syn[8], amp[8] = {0}, note = 60, word = (60 << 11) / 12, pending = 0, k = 0, bad = 0;
-      for (uint32_t i = 0; i < NP; ++i) {
+      const int32_t pmod = (int32_t)lrint(t == 3 ? 70.25 * 65536 : 64 << 16), mtune = t == 3 ? ms_master_tune(4321) : 0;
+      for (uint32_t i = 0; i < PMOD; ++i) {
          double x;
          CHECK(params->get_value(p, i, &x), "value");
          const int32_t w = (int32_t)x << 16;
@@ -155,7 +170,7 @@ int main(int argc, char **argv) {
          int trig = 0;
          if (b % 3 == 0) { trig = b ? (pending == 1 ? 0x81 : pending == 2 ? 0x02 : 0) : 0x80 | (pending == 1 ? 0x81 : 0); pending = 0; word = (note << 11) / 12; }
          int32_t y[MS_FRAMES], g[2][MS_FRAMES], lr[2][MS_FRAMES];
-         const int32_t pitch = ms_pitch(&glide, word, syn[7], amp[MS_PORT], 2880);
+         const int32_t pitch = ms_pitch(&glide, word, syn[7], amp[MS_PORT], 2880, pmod, mtune);
          if (b - start == 30001 / MS_FRAMES + 3 + 60) mid = pitch;   /* 60 blocks into the glide from 30 to 90 */
          if (b - start == 30001 / MS_FRAMES - 3) from = pitch;
          ms_block(&f, syn, pitch, trig & 0x80, y);
@@ -173,7 +188,7 @@ int main(int argc, char **argv) {
    }
 
    /* pitch: SAW at its defaults is one saw */
-   const double plain[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, 127, NAN, 127, NAN, NAN};
+   const double plain[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, 127, NAN, 127, NAN, NAN, NAN, NAN, NAN};
    static const Note a4[] = {{0, 1, 69}};
    for (int r = 0; r < 2; ++r) {
       const double rate = r ? 48000 : 44100;
@@ -192,6 +207,25 @@ int main(int argc, char **argv) {
       done(p);
       const double cents = 1200 * log2(frequency(out, N / 4, N, 44100) / 440);
       CHECK(fabs(cents - 197) < 1, "TUNE 127 is %+.1f cents", cents);
+   }
+   {  /* pitch bend at its ends (2/12: +-127 x 63 x 8 in word 30), Pitch Mod 65, Master Tune 415.3 Hz */
+      static const Note up[] = {{0, 1, 69}, {0, 2, 16383}}, down[] = {{0, 1, 69}, {0, 2, 0}};
+      const int32_t full = 127 * 63 * 8;
+      double v[NP];
+      memcpy(v, plain, sizeof v);
+      for (int t = 0; t < 4; ++t) {
+         if (t == 2) v[PMOD] = 65;
+         if (t == 3) { v[PMOD] = NAN; v[MTUNE] = 415.3; }
+         const clap_plugin_t *p = make(MS_SAW, v, 44100);
+         run(p, t == 0 ? up : t == 1 ? down : a4, t < 2 ? 2 : 1, out);
+         done(p);
+         const double hz = frequency(out, N / 4, N, 44100);
+         const double want = note_hz_at(69, t == 0 ? (64 << 16) + full : t == 1 ? (64 << 16) - full : t == 2 ? 65 << 16 : 64 << 16,
+                                        t == 3 ? ms_master_tune(4153) : 0);
+         CHECK(fabs(hz - want) < 0.01, "pitch case %d: %.3f Hz, not %.3f", t, hz, want);
+         static const double cents[4] = {201.4, -201.4, 206.2, -100.0};
+         CHECK(fabs(1200 * log2(hz / note_hz(69)) - cents[t]) < 0.6, "pitch case %d: %+.1f cents", t, 1200 * log2(hz / note_hz(69)));
+      }
    }
 
    /* the note stack and the release */
@@ -251,6 +285,7 @@ int main(int argc, char **argv) {
    for (int m = 0; m < 3; ++m) {
       double v[NP];
       for (int i = 0; i < NP; ++i) v[i] = (i * 37 + m * 11) % 128;
+      v[BEND] = (int)v[BEND] % 8; v[MTUNE] = 400 + v[MTUNE] / 2;
       const clap_plugin_t *p = make(m, v, 44100), *q = make(m, defaults, 44100), *other = make((m + 1) % 3, defaults, 44100);
       const clap_plugin_state_t *st = p->get_extension(p, CLAP_EXT_STATE);
       Buffer b = {{0}, 0, 0};
@@ -264,8 +299,12 @@ int main(int argc, char **argv) {
       CHECK(!((const clap_plugin_state_t *)other->get_extension(other, CLAP_EXT_STATE))->load(other, &is), "another machine's state accepted");
       b.pos = 0; b.size -= 8;
       CHECK(!st->load(p, &is), "short state accepted");
-      b.pos = 0; b.size += 8; b.data[7] = 2;
+      b.pos = 0; b.size += 8; b.data[7] = 3;
       CHECK(!st->load(p, &is), "unknown version accepted");
+      b.pos = 0; b.data[7] = 1; b.size = 8 + 8 * PMOD;   /* version 1: the pitch parameters at their defaults */
+      CHECK(st->load(q, &is), "version 1 state");
+      for (uint32_t i = 0; i < NP; ++i) { double x; CHECK(pp->get_value(q, i, &x) && x == (i < PMOD ? v[i] : (const double[]){64, 1, 440}[i - PMOD]), "version 1 value %u", i); }
+      b.size = 8 + 8 * NP;
       b.pos = 0; b.data[7] = 1; b.data[8] ^= 0xff; b.data[15] = 0x7f;
       CHECK(!st->load(p, &is), "bad value accepted");
       char text[64];
@@ -276,6 +315,7 @@ int main(int argc, char **argv) {
       const clap_plugin_t *p = make(MS_ENS, defaults, 44100), *q = make(MS_PULS, defaults, 44100), *r = make(MS_SAW, defaults, 44100);
       const clap_plugin_params_t *pp = p->get_extension(p, CLAP_EXT_PARAMS), *qp = q->get_extension(q, CLAP_EXT_PARAMS), *rp = r->get_extension(r, CLAP_EXT_PARAMS);
       char text[64];
+      clap_param_info_t info;
       CHECK(pp->value_to_text(p, 0, 63, text, sizeof text) && !strcmp(text, "63.0 (unison: off)"), "interval text %s", text);
       CHECK(pp->value_to_text(p, 1, 100, text, sizeof text) && !strcmp(text, "100.0 (+7 st)"), "interval text %s", text);
       CHECK(pp->value_to_text(p, 2, 105, text, sizeof text) && !strcmp(text, "105.0 (3/2)"), "interval text %s", text);
@@ -284,7 +324,15 @@ int main(int argc, char **argv) {
       CHECK(qp->value_to_text(q, 4, 64, text, sizeof text) && !strcmp(text, "64.0 (50%)"), "width text %s", text);
       CHECK(qp->value_to_text(q, 6, 64, text, sizeof text) && !strcmp(text, "64.0 (on)"), "restart text %s", text);
       CHECK(rp->value_to_text(r, 1, 127, text, sizeof text) && !strcmp(text, "127.0 (-52.9 +54.5 cents)"), "detune text %s", text);
-      clap_param_info_t info;
+      CHECK(rp->value_to_text(r, PMOD, 64, text, sizeof text) && !strcmp(text, "64.0 (+0.00 st)"), "pitch mod text %s", text);
+      CHECK(rp->value_to_text(r, PMOD, 65, text, sizeof text) && !strcmp(text, "65.0 (+2.06 st)"), "pitch mod text %s", text);
+      CHECK(rp->value_to_text(r, BEND, 1, text, sizeof text) && !strcmp(text, "2/12 (+-2.01 st)"), "bend text %s", text);
+      CHECK(rp->value_to_text(r, MTUNE, 440, text, sizeof text) && !strcmp(text, "440.0 Hz"), "master tune text %s", text);
+      double y;
+      CHECK(rp->text_to_value(r, BEND, "1OCT (+-12.09 st)", &y) && y == 3, "bend from text");
+      CHECK(rp->text_to_value(r, MTUNE, "415.3 Hz", &y) && y == 415.3, "master tune from text");
+      CHECK(rp->get_info(r, BEND, &info) && (info.flags & CLAP_PARAM_IS_STEPPED) && !(info.flags & CLAP_PARAM_IS_MODULATABLE), "Bend Range's flags");
+      CHECK(rp->get_info(r, PMOD, &info) && (info.flags & CLAP_PARAM_IS_MODULATABLE) && info.default_value == 64, "Pitch Mod's flags");
       CHECK(rp->get_info(r, 3, &info) && (info.flags & CLAP_PARAM_IS_HIDDEN) && !(info.flags & CLAP_PARAM_IS_AUTOMATABLE), "SAW's unused knob");
       CHECK(rp->get_info(r, 4, &info) && !(info.flags & CLAP_PARAM_IS_HIDDEN), "SAW's Sub Saw");
       double x;

@@ -30,7 +30,8 @@
  * truncation, rounding and saturation where the original has them. Controls
  * are the 24-bit block words the Monomachine's main CPU sends (knob value
  * << 16), and the pitch is the track's pitch index (2048 per octave; MIDI
- * note n is (n << 11) / 12 + 340 at TUNE 64 once ms_pitch has glided to it).
+ * note n is (n << 11) / 12 + 341 at TUNE 64 and 440 Hz once ms_pitch has
+ * glided to it).
  *
  * C99 and libm (for the tables). SPDX-License-Identifier: GPL-3.0-only */
 #ifndef MONO_SWAVE_H
@@ -266,15 +267,20 @@ static void ms_tables(void) {
 
 /* The kernel's pitch glide, from the track's note word ((note << 11) / 12,
  * sent with every control frame) to the pitch index for each block, with
- * TUNE (the eighth SYN word: +-2 semitones). The glide is linear, at a speed
- * set by PORT (the AMP page's eighth word) times the tick (block word 42,
- * 24 x BPM), so its length is in beats. With PORT at 0 a new note is reached
- * in two blocks: 127/128 of the way, then the rest. (As in Mono FM+.) */
+ * TUNE (the eighth SYN word: +-2 semitones), the pitch modulation pmod
+ * (block word 30: 64 << 16 at rest, 352 units a step; the LFOs and KIT
+ * ASSIGN controllers aimed at PTCH) and the master tune (word 38, 0 at
+ * 440 Hz). The glide is linear, at a speed set by PORT (the AMP page's
+ * eighth word) times the tick (block word 42, 24 x BPM), so its length is in
+ * beats: about 0.0036 x 2^(13 PORT/128) beats for the whole way. With PORT
+ * at 0 a new note is reached in two blocks: 127/128 of the way, then the
+ * rest. The kernel's second glide (words 34 and 28, the MULTI TRIG
+ * transpose) is left out: with word 34 at 0 it adds nothing. */
 typedef struct { ms_acc now; int32_t start, target; } MsPitch;
 
 static void ms_pitch_reset(MsPitch *g, int32_t word) { g->now = ms_w(word); g->start = g->target = word; }
 
-static int32_t ms_pitch(MsPitch *g, int32_t word, int32_t tune, int32_t port, int32_t tick) {
+static int32_t ms_pitch(MsPitch *g, int32_t word, int32_t tune, int32_t port, int32_t tick, int32_t pmod, int32_t mtune) {
    if (word != g->target) {   /* a glide still under way restarts from where it is */
       const int32_t now = ms_hi(g->now);
       if ((word < now && g->target >= now) || (word >= now && g->target < now)) g->start = g->target;
@@ -286,8 +292,30 @@ static int32_t ms_pitch(MsPitch *g, int32_t word, int32_t tune, int32_t port, in
    ms_acc a = g->now + ms_mpy(ms_sat(dist), rate);
    if (dist >= 0 ? a > ms_w(g->target) : a < ms_w(g->target)) { g->start = g->target; a = ms_w(g->target); }
    g->now = ms_raw(a);
-   const ms_acc p = a + ms_w(-1) + ms_mpy(0x2ab, tune);   /* master tune at 440 Hz, and TUNE (341.5 at 64) */
+   const ms_acc p = a + ms_w(mtune) + ms_mpy(0x2ab, tune) + ms_mpy(0xb000, pmod) - ms_w(0x5800);   /* TUNE: 341.5 at 64 */
    return p < 0 ? 0 : p >= ms_w(MS_PITCH_MAX) ? MS_PITCH_MAX : ms_hi(p);
+}
+
+/* The main CPU's pitch words (main OS of OS 1.32B). Word 38 for MASTER TUNE
+ * in tenths of a hertz, 4000..4999: its table at 0x251210 is
+ * trunc(2048 log2(f / 440)). */
+static int32_t ms_master_tune(int tenths) { return (int32_t)(2048.0 * log2(tenths / 4400.0)); }
+
+/* What a pitch bend adds to word 30 through KIT ASSIGN JOY R/L with MIRR on,
+ * PAGE PTCH, DEST range (0..7: 1/12 2/12 7/12 1OCT 2OCT 4OCT 8OCT 16OC) and
+ * ADD +63: the bend's top 8 bits v (2 msb + (lsb >> 6)) are JOY R at v - 128
+ * and JOY L at 127 - v, whose ADD the mirror negates; value x ADD x the
+ * range's step, which is 4 x the range in semitones (the main OS's steps at
+ * 0x251b30: 4 8 28 48 96 192 384 768). */
+static int32_t ms_bend(int v, int range) {
+   static const int32_t semitones[8] = {1, 2, 7, 12, 24, 48, 96, 192};   /* the DEST names */
+   return (v >= 128 ? v - 128 : v - 127) * 63 * 4 * semitones[range & 7];
+}
+
+/* A controller's value added to its word as 0x010003ba does: clamped on the side it moves to. */
+static int32_t ms_add_mod(int32_t word, int32_t v) {
+   const int32_t w = word + v;
+   return v > 0 && w > 0x7effff ? 0x7effff : v < 0 && w < 0 ? 0 : w;
 }
 
 /* The kernel's frequency word for a pitch index (register a on the machine's entry). */
